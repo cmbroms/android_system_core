@@ -33,7 +33,6 @@
 #include <sys/wait.h>
 #include <linux/loop.h>
 #include <cutils/partition_utils.h>
-#include <cutils/android_reboot.h>
 #include <sys/system_properties.h>
 #include <fs_mgr.h>
 #include <fts.h>
@@ -60,7 +59,7 @@ static int write_file(const char *path, const char *value)
 {
     int fd, ret, len;
 
-    fd = open(path, O_WRONLY|O_CREAT|O_NOFOLLOW, 0600);
+    fd = open(path, O_WRONLY|O_CREAT, 0622);
 
     if (fd < 0)
         return -errno;
@@ -347,6 +346,32 @@ int do_insmod(int nargs, char **args)
     return do_insmod_inner(nargs, args, size);
 }
 
+int do_log(int nargs, char **args)
+{
+    char* par[nargs+3];
+    char* value;
+    int i;
+
+    par[0] = "exec";
+    par[1] = "/system/bin/log";
+    par[2] = "-tinit";
+    for (i = 1; i < nargs; ++i) {
+        value = args[i];
+        if (value[0] == '$') {
+            /* system property if value starts with '$' */
+            value++;
+            if (value[0] != '$') {
+                value = (char*) property_get(value);
+                if (!value) value = args[i];
+            }
+        }
+        par[i+2] = value;
+    }
+    par[nargs+2] = NULL;
+
+    return do_exec(nargs+2, par);
+}
+
 int do_mkdir(int nargs, char **args)
 {
     mode_t mode = 0755;
@@ -573,18 +598,6 @@ int do_mount_all(int nargs, char **args)
     return ret;
 }
 
-int do_swapon_all(int nargs, char **args)
-{
-    struct fstab *fstab;
-    int ret;
-
-    fstab = fs_mgr_read_fstab(args[1]);
-    ret = fs_mgr_swapon_all(fstab);
-    fs_mgr_free_fstab(fstab);
-
-    return ret;
-}
-
 int do_setcon(int nargs, char **args) {
     if (is_selinux_enabled() <= 0)
         return 0;
@@ -663,46 +676,10 @@ int do_restart(int nargs, char **args)
     struct service *svc;
     svc = service_find_by_name(args[1]);
     if (svc) {
-        service_restart(svc);
+        service_stop(svc);
+        service_start(svc, NULL);
     }
     return 0;
-}
-
-int do_powerctl(int nargs, char **args)
-{
-    char command[PROP_VALUE_MAX];
-    int res;
-    int len = 0;
-    int cmd = 0;
-    char *reboot_target;
-
-    res = expand_props(command, args[1], sizeof(command));
-    if (res) {
-        ERROR("powerctl: cannot expand '%s'\n", args[1]);
-        return -EINVAL;
-    }
-
-    if (strncmp(command, "shutdown", 8) == 0) {
-        cmd = ANDROID_RB_POWEROFF;
-        len = 8;
-    } else if (strncmp(command, "reboot", 6) == 0) {
-        cmd = ANDROID_RB_RESTART2;
-        len = 6;
-    } else {
-        ERROR("powerctl: unrecognized command '%s'\n", command);
-        return -EINVAL;
-    }
-
-    if (command[len] == ',') {
-        reboot_target = &command[len + 1];
-    } else if (command[len] == '\0') {
-        reboot_target = "";
-    } else {
-        ERROR("powerctl: unrecognized reboot target '%s'\n", &command[len]);
-        return -EINVAL;
-    }
-
-    return android_reboot(cmd, 0, reboot_target);
 }
 
 int do_trigger(int nargs, char **args)
@@ -895,24 +872,12 @@ int do_chmod(int nargs, char **args) {
 
 int do_restorecon(int nargs, char **args) {
     int i;
-    int ret = 0;
 
     for (i = 1; i < nargs; i++) {
         if (restorecon(args[i]) < 0)
-            ret = -errno;
+            return -errno;
     }
-    return ret;
-}
-
-int do_restorecon_recursive(int nargs, char **args) {
-    int i;
-    int ret = 0;
-
-    for (i = 1; i < nargs; i++) {
-        if (restorecon_recursive(args[i]) < 0)
-            ret = -errno;
-    }
-    return ret;
+    return 0;
 }
 
 int do_setsebool(int nargs, char **args) {

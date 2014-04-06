@@ -1,11 +1,10 @@
 #include <alloca.h>
 #include <errno.h>
-#include <pthread.h>
-#include <signal.h>
-#include <string.h>
-#include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <pthread.h>
+#include <string.h>
+#include <arpa/inet.h>
 
 #define LOG_TAG "SocketClient"
 #include <cutils/log.h>
@@ -44,7 +43,8 @@ void SocketClient::init(int socket, bool owned, bool useCmdNum) {
     }
 }
 
-SocketClient::~SocketClient() {
+SocketClient::~SocketClient()
+{
     if (mSocketOwned) {
         close(mSocket);
     }
@@ -71,7 +71,7 @@ int SocketClient::sendMsg(int code, const char *msg, bool addErrno, bool useCmdN
             ret = asprintf(&buf, "%d %s", code, msg);
         }
     }
-    // Send the zero-terminated message
+    /* Send the zero-terminated message */
     if (ret != -1) {
         ret = sendMsg(buf);
         free(buf);
@@ -79,25 +79,22 @@ int SocketClient::sendMsg(int code, const char *msg, bool addErrno, bool useCmdN
     return ret;
 }
 
-// send 3-digit code, null, binary-length, binary data
+/** send 3-digit code, null, binary-length, binary data */
 int SocketClient::sendBinaryMsg(int code, const void *data, int len) {
 
-    // 4 bytes for the code & null + 4 bytes for the len
+    /* 4 bytes for the code & null + 4 bytes for the len */
     char buf[8];
-    // Write the code
+    /* Write the code */
     snprintf(buf, 4, "%.3d", code);
-    // Write the len
+    /* Write the len */
     uint32_t tmp = htonl(len);
     memcpy(buf + 4, &tmp, sizeof(uint32_t));
 
-    struct iovec vec[2];
-    vec[0].iov_base = (void *) buf;
-    vec[0].iov_len = sizeof(buf);
-    vec[1].iov_base = (void *) data;
-    vec[1].iov_len = len;
-
     pthread_mutex_lock(&mWriteMutex);
-    int result = sendDataLockedv(vec, (len > 0) ? 2 : 1);
+    int result = sendDataLocked(buf, sizeof(buf));
+    if (result == 0 && len > 0) {
+        result = sendDataLocked(data, len);
+    }
     pthread_mutex_unlock(&mWriteMutex);
 
     return result;
@@ -150,78 +147,48 @@ int SocketClient::sendMsg(const char *msg) {
 }
 
 int SocketClient::sendData(const void *data, int len) {
-    struct iovec vec[1];
-    vec[0].iov_base = (void *) data;
-    vec[0].iov_len = len;
 
     pthread_mutex_lock(&mWriteMutex);
-    int rc = sendDataLockedv(vec, 1);
+    int rc = sendDataLocked(data, len);
     pthread_mutex_unlock(&mWriteMutex);
 
     return rc;
 }
 
-int SocketClient::sendDatav(struct iovec *iov, int iovcnt) {
-    pthread_mutex_lock(&mWriteMutex);
-    int rc = sendDataLockedv(iov, iovcnt);
-    pthread_mutex_unlock(&mWriteMutex);
-
-    return rc;
-}
-
-int SocketClient::sendDataLockedv(struct iovec *iov, int iovcnt) {
+int SocketClient::sendDataLocked(const void *data, int len) {
+    int rc = 0;
+    const char *p = (const char*) data;
+    int brtw = len;
 
     if (mSocket < 0) {
         errno = EHOSTUNREACH;
         return -1;
     }
 
-    if (iovcnt <= 0) {
+    if (len == 0) {
         return 0;
     }
 
-    int ret = 0;
-    int e = 0; // SLOGW and sigaction are not inert regarding errno
-    int current = 0;
-
-    struct sigaction new_action, old_action;
-    memset(&new_action, 0, sizeof(new_action));
-    new_action.sa_handler = SIG_IGN;
-    sigaction(SIGPIPE, &new_action, &old_action);
-
-    for (;;) {
-        ssize_t rc = TEMP_FAILURE_RETRY(
-            writev(mSocket, iov + current, iovcnt - current));
-
+    while (brtw > 0) {
+        rc = send(mSocket, p, brtw, MSG_NOSIGNAL);
         if (rc > 0) {
-            size_t written = rc;
-            while ((current < iovcnt) && (written >= iov[current].iov_len)) {
-                written -= iov[current].iov_len;
-                current++;
-            }
-            if (current == iovcnt) {
-                break;
-            }
-            iov[current].iov_base = (char *)iov[current].iov_base + written;
-            iov[current].iov_len -= written;
+            p += rc;
+            brtw -= rc;
             continue;
         }
 
+        if (rc < 0 && errno == EINTR)
+            continue;
+
         if (rc == 0) {
-            e = EIO;
             SLOGW("0 length write :(");
+            errno = EIO;
         } else {
-            e = errno;
-            SLOGW("write error (%s)", strerror(e));
+            SLOGW("write error (%s)", strerror(errno));
         }
-        ret = -1;
-        break;
+        return -1;
     }
-
-    sigaction(SIGPIPE, &old_action, &new_action);
-
-    errno = e;
-    return ret;
+    return 0;
 }
 
 void SocketClient::incRef() {

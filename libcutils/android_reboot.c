@@ -93,7 +93,7 @@ static void remount_ro(void)
 
 
     /* Now poll /proc/mounts till it's done */
-    while (!remount_ro_done() && (cnt < 3600)) {
+    while (!remount_ro_done() && (cnt < 50)) {
         usleep(100000);
         cnt++;
     }
@@ -117,8 +117,11 @@ int android_reboot(int cmd, int flags, char *arg)
     }
 #endif
 
-    sync();
-    remount_ro();
+    if (!(flags & ANDROID_RB_FLAG_NO_SYNC))
+        sync();
+
+    if (!(flags & ANDROID_RB_FLAG_NO_REMOUNT_RO))
+        remount_ro();
 
     switch (cmd) {
         case ANDROID_RB_RESTART:

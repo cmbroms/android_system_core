@@ -22,10 +22,8 @@
 #include <ctype.h>
 #include <errno.h>
 #include <time.h>
-#include <ftw.h>
 
 #include <selinux/label.h>
-#include <selinux/android.h>
 
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -313,27 +311,14 @@ int mkdir_recursive(const char *pathname, mode_t mode)
     return 0;
 }
 
-/*
- * replaces any unacceptable characters with '_', the
- * length of the resulting string is equal to the input string
- */
 void sanitize(char *s)
 {
-    const char* accept =
-            "abcdefghijklmnopqrstuvwxyz"
-            "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-            "0123456789"
-            "_-.";
-
     if (!s)
         return;
-
-    for (; *s; s++) {
-        s += strspn(s, accept);
-        if (*s) *s = '_';
-    }
+    while (isalnum(*s))
+        s++;
+    *s = 0;
 }
-
 void make_link(const char *oldpath, const char *newpath)
 {
     int ret;
@@ -499,12 +484,23 @@ int make_dir(const char *path, mode_t mode)
     return rc;
 }
 
-int restorecon(const char* pathname)
+int restorecon(const char *pathname)
 {
-    return selinux_android_restorecon(pathname, 0);
-}
+    char *secontext = NULL;
+    struct stat sb;
+    int i;
 
-int restorecon_recursive(const char* pathname)
-{
-    return selinux_android_restorecon(pathname, SELINUX_ANDROID_RESTORECON_RECURSE);
+    if (is_selinux_enabled() <= 0 || !sehandle)
+        return 0;
+
+    if (lstat(pathname, &sb) < 0)
+        return -errno;
+    if (selabel_lookup(sehandle, &secontext, pathname, sb.st_mode) < 0)
+        return -errno;
+    if (lsetfilecon(pathname, secontext) < 0) {
+        freecon(secontext);
+        return -errno;
+    }
+    freecon(secontext);
+    return 0;
 }

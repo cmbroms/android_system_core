@@ -64,6 +64,7 @@ LOCAL_SRC_FILES := \
 	file_sync_client.c \
 	$(EXTRA_SRCS) \
 	$(USB_SRCS) \
+	utils.c \
 	usb_vendors.c
 
 LOCAL_C_INCLUDES += external/openssl/include
@@ -115,7 +116,8 @@ LOCAL_SRC_FILES := \
 	framebuffer_service.c \
 	remount_service.c \
 	usb_linux_client.c \
-	log_service.c
+	log_service.c \
+	utils.c
 
 LOCAL_CFLAGS := -O2 -g -DADB_HOST=0 -Wall -Wno-unused-parameter
 LOCAL_CFLAGS += -D_XOPEN_SOURCE -D_GNU_SOURCE
@@ -136,7 +138,7 @@ LOCAL_FORCE_STATIC_EXECUTABLE := true
 LOCAL_MODULE_PATH := $(TARGET_ROOT_OUT_SBIN)
 LOCAL_UNSTRIPPED_PATH := $(TARGET_ROOT_OUT_SBIN_UNSTRIPPED)
 
-LOCAL_STATIC_LIBRARIES := liblog libcutils libc libmincrypt libselinux
+LOCAL_STATIC_LIBRARIES := libcutils libc libmincrypt
 include $(BUILD_EXECUTABLE)
 
 
@@ -161,6 +163,7 @@ LOCAL_SRC_FILES := \
 	file_sync_client.c \
 	get_my_path_linux.c \
 	usb_linux.c \
+	utils.c \
 	usb_vendors.c \
 	fdevent.c
 

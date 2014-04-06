@@ -22,31 +22,19 @@
 #include <sys/types.h>
 #include <dirent.h>
 #include <utime.h>
-#include <unistd.h>
 
 #include <errno.h>
-#include <private/android_filesystem_config.h>
-#include <selinux/android.h>
+
 #include "sysdeps.h"
 
 #define TRACE_TAG  TRACE_SYNC
 #include "adb.h"
 #include "file_sync_service.h"
 
-/* TODO: use fs_config to configure permissions on /data */
-static bool is_on_system(const char *name) {
-    const char *SYSTEM = "/system/";
-    return (strncmp(SYSTEM, name, strlen(SYSTEM)) == 0);
-}
-
 static int mkdirs(char *name)
 {
     int ret;
     char *x = name + 1;
-    uid_t uid = -1;
-    gid_t gid = -1;
-    unsigned int mode = 0775;
-    uint64_t cap = 0;
 
     if(name[0] != '/') return -1;
 
@@ -54,21 +42,11 @@ static int mkdirs(char *name)
         x = adb_dirstart(x);
         if(x == 0) return 0;
         *x = 0;
-        if (is_on_system(name)) {
-            fs_config(name, 1, &uid, &gid, &mode, &cap);
-        }
-        ret = adb_mkdir(name, mode);
+        ret = adb_mkdir(name, 0775);
         if((ret < 0) && (errno != EEXIST)) {
             D("mkdir(\"%s\") -> %s\n", name, strerror(errno));
             *x = '/';
             return ret;
-        } else if(ret == 0) {
-            ret = chown(name, uid, gid);
-            if (ret < 0) {
-                *x = '/';
-                return ret;
-            }
-            selinux_android_restorecon(name, 0);
         }
         *x++ = '/';
     }
@@ -132,7 +110,6 @@ static int do_list(int s, const char *path)
 
             if(writex(s, &msg.dent, sizeof(msg.dent)) ||
                writex(s, de->d_name, len)) {
-                closedir(d);
                 return -1;
             }
         }
@@ -171,8 +148,7 @@ static int fail_errno(int s)
     return fail_message(s, strerror(errno));
 }
 
-static int handle_send_file(int s, char *path, uid_t uid,
-        gid_t gid, mode_t mode, char *buffer)
+static int handle_send_file(int s, char *path, mode_t mode, char *buffer)
 {
     syncmsg msg;
     unsigned int timestamp = 0;
@@ -180,13 +156,8 @@ static int handle_send_file(int s, char *path, uid_t uid,
 
     fd = adb_open_mode(path, O_WRONLY | O_CREAT | O_EXCL, mode);
     if(fd < 0 && errno == ENOENT) {
-        if(mkdirs(path) != 0) {
-            if(fail_errno(s))
-                return -1;
-            fd = -1;
-        } else {
-            fd = adb_open_mode(path, O_WRONLY | O_CREAT | O_EXCL, mode);
-        }
+        mkdirs(path);
+        fd = adb_open_mode(path, O_WRONLY | O_CREAT | O_EXCL, mode);
     }
     if(fd < 0 && errno == EEXIST) {
         fd = adb_open_mode(path, O_WRONLY, mode);
@@ -195,18 +166,6 @@ static int handle_send_file(int s, char *path, uid_t uid,
         if(fail_errno(s))
             return -1;
         fd = -1;
-    } else {
-        if(fchown(fd, uid, gid) != 0) {
-            fail_errno(s);
-            errno = 0;
-        }
-
-        /*
-         * fchown clears the setuid bit - restore it if present.
-         * Ignore the result of calling fchmod. It's not supported
-         * by all filesystems. b/12441485
-         */
-        fchmod(fd, mode);
     }
 
     for(;;) {
@@ -246,7 +205,6 @@ static int handle_send_file(int s, char *path, uid_t uid,
     if(fd >= 0) {
         struct utimbuf u;
         adb_close(fd);
-        selinux_android_restorecon(path, 0);
         u.actime = timestamp;
         u.modtime = timestamp;
         utime(path, &u);
@@ -290,10 +248,7 @@ static int handle_send_link(int s, char *path, char *buffer)
 
     ret = symlink(buffer, path);
     if(ret && errno == ENOENT) {
-        if(mkdirs(path) != 0) {
-            fail_errno(s);
-            return -1;
-        }
+        mkdirs(path);
         ret = symlink(buffer, path);
     }
     if(ret) {
@@ -321,7 +276,7 @@ static int handle_send_link(int s, char *path, char *buffer)
 static int do_send(int s, char *path, char *buffer)
 {
     char *tmp;
-    unsigned int mode;
+    mode_t mode;
     int is_link, ret;
 
     tmp = strrchr(path,',');
@@ -332,7 +287,7 @@ static int do_send(int s, char *path, char *buffer)
 #ifndef HAVE_SYMLINKS
         is_link = 0;
 #else
-        is_link = S_ISLNK((mode_t) mode);
+        is_link = S_ISLNK(mode);
 #endif
         mode &= 0777;
     }
@@ -351,22 +306,11 @@ static int do_send(int s, char *path, char *buffer)
 #else
     {
 #endif
-        uid_t uid = -1;
-        gid_t gid = -1;
-        uint64_t cap = 0;
-
         /* copy user permission bits to "group" and "other" permissions */
         mode |= ((mode >> 3) & 0070);
         mode |= ((mode >> 3) & 0007);
 
-        tmp = path;
-        if(*tmp == '/') {
-            tmp++;
-        }
-        if (is_on_system(path)) {
-            fs_config(tmp, 0, &uid, &gid, &mode, &cap);
-        }
-        ret = handle_send_file(s, path, uid, gid, mode, buffer);
+        ret = handle_send_file(s, path, mode, buffer);
     }
 
     return ret;

@@ -31,10 +31,9 @@
 #include <sys/stat.h>
 #include <sys/poll.h>
 
-#include <log/logd.h>
-#include <log/logger.h>
-
 #include <cutils/sockets.h>
+#include <cutils/logd.h>
+#include <cutils/logger.h>
 #include <cutils/properties.h>
 #include <cutils/debugger.h>
 

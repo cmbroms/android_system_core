@@ -19,7 +19,7 @@
  * passed on to the underlying (fake) log device.  When not in the
  * simulator, messages are printed to stderr.
  */
-#include <log/logd.h>
+#include "cutils/logd.h"
 
 #include <stdlib.h>
 #include <string.h>

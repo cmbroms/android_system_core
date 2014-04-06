@@ -59,28 +59,23 @@ include $(BUILD_SHARED_LIBRARY)
 
 # Build test.
 include $(CLEAR_VARS)
-LOCAL_SRC_FILES := test.cpp
-LOCAL_CFLAGS += -Werror -fno-inline-small-functions
+LOCAL_SRC_FILES := test.c
+LOCAL_CFLAGS += -std=gnu99 -Werror -fno-inline-small-functions
 LOCAL_SHARED_LIBRARIES := libcorkscrew
 LOCAL_MODULE := libcorkscrew_test
 LOCAL_MODULE_TAGS := optional
 include $(BUILD_EXECUTABLE)
 
 
-# TODO: reenable darwin-x86
-# ifeq ($(HOST_ARCH),x86)
 ifeq ($(HOST_OS)-$(HOST_ARCH),linux-x86)
 
 # Build libcorkscrew.
 include $(CLEAR_VARS)
 LOCAL_SRC_FILES += $(generic_src_files) $(x86_src_files)
 LOCAL_CFLAGS += -DCORKSCREW_HAVE_ARCH
+LOCAL_SHARED_LIBRARIES += libgccdemangle
 LOCAL_STATIC_LIBRARIES += libcutils liblog
-LOCAL_LDLIBS += -ldl
-ifeq ($(HOST_OS),linux)
-  LOCAL_SHARED_LIBRARIES += libgccdemangle # TODO: is this even needed on Linux?
-  LOCAL_LDLIBS += -lrt
-endif
+LOCAL_LDLIBS += -ldl -lrt
 LOCAL_CFLAGS += -std=gnu99 -Werror
 LOCAL_MODULE := libcorkscrew
 LOCAL_MODULE_TAGS := optional
@@ -88,11 +83,11 @@ include $(BUILD_HOST_SHARED_LIBRARY)
 
 # Build test.
 include $(CLEAR_VARS)
-LOCAL_SRC_FILES := test.cpp
-LOCAL_CFLAGS += -Werror
+LOCAL_SRC_FILES := test.c
+LOCAL_CFLAGS += -std=gnu99 -Werror -fno-inline-small-functions
 LOCAL_SHARED_LIBRARIES := libcorkscrew
 LOCAL_MODULE := libcorkscrew_test
 LOCAL_MODULE_TAGS := optional
 include $(BUILD_HOST_EXECUTABLE)
 
-endif # HOST_ARCH == x86
+endif # linux-x86

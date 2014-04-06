@@ -33,7 +33,6 @@
 #include <selinux/selinux.h>
 #include <selinux/label.h>
 #include <selinux/android.h>
-#include <selinux/avc.h>
 
 #include <private/android_filesystem_config.h>
 #include <sys/time.h>
@@ -128,7 +127,6 @@ void fixup_sys_perms(const char *upath)
     char buf[512];
     struct listnode *node;
     struct perms_ *dp;
-    char *secontext;
 
         /* upaths omit the "/sys" that paths in this list
          * contain, so we add 4 when comparing...
@@ -150,14 +148,7 @@ void fixup_sys_perms(const char *upath)
         INFO("fixup %s %d %d 0%o\n", buf, dp->uid, dp->gid, dp->perm);
         chown(buf, dp->uid, dp->gid);
         chmod(buf, dp->perm);
-        if (sehandle) {
-            secontext = NULL;
-            selabel_lookup(sehandle, &secontext, buf, 0);
-            if (secontext) {
-                setfilecon(buf, secontext);
-                freecon(secontext);
-           }
-        }
+        restorecon(buf);
     }
 }
 
@@ -487,8 +478,6 @@ static char **parse_platform_block_device(struct uevent *uevent)
     if (uevent->partition_name) {
         p = strdup(uevent->partition_name);
         sanitize(p);
-        if (strcmp(uevent->partition_name, p))
-            NOTICE("Linking partition '%s' as '%s'\n", uevent->partition_name, p);
         if (asprintf(&links[link_num], "%s/by-name/%s", link_path, p) > 0)
             link_num++;
         else
@@ -868,15 +857,6 @@ void handle_device_fd()
         struct uevent uevent;
         parse_event(msg, &uevent);
 
-        if (sehandle && selinux_status_updated() > 0) {
-            struct selabel_handle *sehandle2;
-            sehandle2 = selinux_android_file_context_handle();
-            if (sehandle2) {
-                selabel_close(sehandle);
-                sehandle = sehandle2;
-            }
-        }
-
         handle_device_event(&uevent);
         handle_firmware_event(&uevent);
     }
@@ -943,7 +923,6 @@ void device_init(void)
     sehandle = NULL;
     if (is_selinux_enabled() > 0) {
         sehandle = selinux_android_file_context_handle();
-        selinux_status_open(true);
     }
 
     /* is 256K enough? udev uses 16MB! */

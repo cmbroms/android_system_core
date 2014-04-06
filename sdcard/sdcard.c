@@ -30,11 +30,6 @@
 #include <pthread.h>
 #include <sys/time.h>
 #include <sys/resource.h>
-#include <sys/inotify.h>
-
-#include <cutils/fs.h>
-#include <cutils/hashmap.h>
-#include <cutils/multiuser.h>
 
 #include <private/android_filesystem_config.h>
 
@@ -62,30 +57,6 @@
  * - if an op that returns a fuse_entry fails writing the reply to the
  * kernel, you must rollback the refcount to reflect the reference the
  * kernel did not actually acquire
- *
- * This daemon can also derive custom filesystem permissions based on directory
- * structure when requested. These custom permissions support several features:
- *
- * - Apps can access their own files in /Android/data/com.example/ without
- * requiring any additional GIDs.
- * - Separate permissions for protecting directories like Pictures and Music.
- * - Multi-user separation on the same physical device.
- *
- * The derived permissions look like this:
- *
- * rwxrwx--x root:sdcard_rw     /
- * rwxrwx--- root:sdcard_pics   /Pictures
- * rwxrwx--- root:sdcard_av     /Music
- *
- * rwxrwx--x root:sdcard_rw     /Android
- * rwxrwx--x root:sdcard_rw     /Android/data
- * rwxrwx--- u0_a12:sdcard_rw   /Android/data/com.example
- * rwxrwx--x root:sdcard_rw     /Android/obb/
- * rwxrwx--- u0_a12:sdcard_rw   /Android/obb/com.example
- *
- * rwxrwx--- root:sdcard_all    /Android/user
- * rwxrwx--x root:sdcard_rw     /Android/user/10
- * rwxrwx--- u10_a12:sdcard_rw  /Android/user/10/Android/data/com.example
  */
 
 #define FUSE_TRACE 0
@@ -118,39 +89,6 @@
  * or that a reply has already been written. */
 #define NO_STATUS 1
 
-/* Path to system-provided mapping of package name to appIds */
-static const char* const kPackagesListFile = "/data/system/packages.list";
-
-/* Supplementary groups to execute with */
-static const gid_t kGroups[1] = { AID_PACKAGE_INFO };
-
-/* Permission mode for a specific node. Controls how file permissions
- * are derived for children nodes. */
-typedef enum {
-    /* Nothing special; this node should just inherit from its parent. */
-    PERM_INHERIT,
-    /* This node is one level above a normal root; used for legacy layouts
-     * which use the first level to represent user_id. */
-    PERM_LEGACY_PRE_ROOT,
-    /* This node is "/" */
-    PERM_ROOT,
-    /* This node is "/Android" */
-    PERM_ANDROID,
-    /* This node is "/Android/data" */
-    PERM_ANDROID_DATA,
-    /* This node is "/Android/obb" */
-    PERM_ANDROID_OBB,
-    /* This node is "/Android/user" */
-    PERM_ANDROID_USER,
-} perm_t;
-
-/* Permissions structure to derive */
-typedef enum {
-    DERIVE_NONE,
-    DERIVE_LEGACY,
-    DERIVE_UNIFIED,
-} derive_t;
-
 struct handle {
     int fd;
 };
@@ -164,13 +102,6 @@ struct node {
     __u64 nid;
     __u64 gen;
 
-    /* State derived based on current position in hierarchy. */
-    perm_t perm;
-    userid_t userid;
-    uid_t uid;
-    gid_t gid;
-    mode_t mode;
-
     struct node *next;          /* per-dir sibling list */
     struct node *child;         /* first contained file by this dir */
     struct node *parent;        /* containing directory */
@@ -183,29 +114,7 @@ struct node {
      * namelen for both fields.
      */
     char *actual_name;
-
-    /* If non-null, an exact underlying path that should be grafted into this
-     * position. Used to support things like OBB. */
-    char* graft_path;
-    size_t graft_pathlen;
 };
-
-static int str_hash(void *key) {
-    return hashmapHash(key, strlen(key));
-}
-
-/** Test if two string keys are equal ignoring case */
-static bool str_icase_equals(void *keyA, void *keyB) {
-    return strcasecmp(keyA, keyB) == 0;
-}
-
-static int int_hash(void *key) {
-    return (int) key;
-}
-
-static bool int_equals(void *keyA, void *keyB) {
-    return keyA == keyB;
-}
 
 /* Global data structure shared by all fuse handlers. */
 struct fuse {
@@ -213,14 +122,8 @@ struct fuse {
 
     __u64 next_generation;
     int fd;
-    derive_t derive;
-    bool split_perms;
-    gid_t write_gid;
     struct node root;
-    char obbpath[PATH_MAX];
-
-    Hashmap* package_to_appid;
-    Hashmap* appid_with_rw;
+    char rootpath[PATH_MAX];
 };
 
 /* Private data used by a single fuse handler. */
@@ -305,26 +208,15 @@ static void remove_node_from_parent_locked(struct node* node)
  * Populates 'buf' with the path and returns the length of the path on success,
  * or returns -1 if the path is too long for the provided buffer.
  */
-static ssize_t get_node_path_locked(struct node* node, char* buf, size_t bufsize) {
-    const char* name;
-    size_t namelen;
-    if (node->graft_path) {
-        name = node->graft_path;
-        namelen = node->graft_pathlen;
-    } else if (node->actual_name) {
-        name = node->actual_name;
-        namelen = node->namelen;
-    } else {
-        name = node->name;
-        namelen = node->namelen;
-    }
-
+static ssize_t get_node_path_locked(struct node* node, char* buf, size_t bufsize)
+{
+    size_t namelen = node->namelen;
     if (bufsize < namelen + 1) {
         return -1;
     }
 
     ssize_t pathlen = 0;
-    if (node->parent && node->graft_path == NULL) {
+    if (node->parent) {
         pathlen = get_node_path_locked(node->parent, buf, bufsize - namelen - 2);
         if (pathlen < 0) {
             return -1;
@@ -332,6 +224,7 @@ static ssize_t get_node_path_locked(struct node* node, char* buf, size_t bufsize
         buf[pathlen++] = '/';
     }
 
+    const char* name = node->actual_name ? node->actual_name : node->name;
     memcpy(buf + pathlen, name, namelen + 1); /* include trailing \0 */
     return pathlen + namelen;
 }
@@ -365,7 +258,7 @@ static char* find_file_within(const char* path, const char* name,
         struct dirent* entry;
         DIR* dir = opendir(path);
         if (!dir) {
-            ERROR("opendir %s failed: %s\n", path, strerror(errno));
+            ERROR("opendir %s failed: %s", path, strerror(errno));
             return actual;
         }
         while ((entry = readdir(dir))) {
@@ -380,9 +273,9 @@ static char* find_file_within(const char* path, const char* name,
     return actual;
 }
 
-static void attr_from_stat(struct fuse_attr *attr, const struct stat *s, const struct node* node)
+static void attr_from_stat(struct fuse_attr *attr, const struct stat *s, __u64 nid)
 {
-    attr->ino = node->nid;
+    attr->ino = nid;
     attr->size = s->st_size;
     attr->blocks = s->st_blocks;
     attr->atime = s->st_atime;
@@ -394,169 +287,19 @@ static void attr_from_stat(struct fuse_attr *attr, const struct stat *s, const s
     attr->mode = s->st_mode;
     attr->nlink = s->st_nlink;
 
-    attr->uid = node->uid;
-    attr->gid = node->gid;
-
-    /* Filter requested mode based on underlying file, and
-     * pass through file type. */
-    int owner_mode = s->st_mode & 0700;
-    int filtered_mode = node->mode & (owner_mode | (owner_mode >> 3) | (owner_mode >> 6));
-    attr->mode = (attr->mode & S_IFMT) | filtered_mode;
-}
-
-static int touch(char* path, mode_t mode) {
-    int fd = open(path, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW, mode);
-    if (fd == -1) {
-        if (errno == EEXIST) {
-            return 0;
-        } else {
-            ERROR("Failed to open(%s): %s\n", path, strerror(errno));
-            return -1;
-        }
-    }
-    close(fd);
-    return 0;
-}
-
-static void derive_permissions_locked(struct fuse* fuse, struct node *parent,
-        struct node *node) {
-    appid_t appid;
-
-    /* By default, each node inherits from its parent */
-    node->perm = PERM_INHERIT;
-    node->userid = parent->userid;
-    node->uid = parent->uid;
-    node->gid = parent->gid;
-    node->mode = parent->mode;
-
-    if (fuse->derive == DERIVE_NONE) {
-        return;
+        /* force permissions to something reasonable:
+         * world readable
+         * writable by the sdcard group
+         */
+    if (attr->mode & 0100) {
+        attr->mode = (attr->mode & (~0777)) | 0775;
+    } else {
+        attr->mode = (attr->mode & (~0777)) | 0664;
     }
 
-    /* Derive custom permissions based on parent and current node */
-    switch (parent->perm) {
-    case PERM_INHERIT:
-        /* Already inherited above */
-        break;
-    case PERM_LEGACY_PRE_ROOT:
-        /* Legacy internal layout places users at top level */
-        node->perm = PERM_ROOT;
-        node->userid = strtoul(node->name, NULL, 10);
-        break;
-    case PERM_ROOT:
-        /* Assume masked off by default. */
-        node->mode = 0770;
-        if (!strcasecmp(node->name, "Android")) {
-            /* App-specific directories inside; let anyone traverse */
-            node->perm = PERM_ANDROID;
-            node->mode = 0771;
-        } else if (fuse->split_perms) {
-            if (!strcasecmp(node->name, "DCIM")
-                    || !strcasecmp(node->name, "Pictures")) {
-                node->gid = AID_SDCARD_PICS;
-            } else if (!strcasecmp(node->name, "Alarms")
-                    || !strcasecmp(node->name, "Movies")
-                    || !strcasecmp(node->name, "Music")
-                    || !strcasecmp(node->name, "Notifications")
-                    || !strcasecmp(node->name, "Podcasts")
-                    || !strcasecmp(node->name, "Ringtones")) {
-                node->gid = AID_SDCARD_AV;
-            }
-        }
-        break;
-    case PERM_ANDROID:
-        if (!strcasecmp(node->name, "data")) {
-            /* App-specific directories inside; let anyone traverse */
-            node->perm = PERM_ANDROID_DATA;
-            node->mode = 0771;
-        } else if (!strcasecmp(node->name, "obb")) {
-            /* App-specific directories inside; let anyone traverse */
-            node->perm = PERM_ANDROID_OBB;
-            node->mode = 0771;
-            /* Single OBB directory is always shared */
-            node->graft_path = fuse->obbpath;
-            node->graft_pathlen = strlen(fuse->obbpath);
-        } else if (!strcasecmp(node->name, "user")) {
-            /* User directories must only be accessible to system, protected
-             * by sdcard_all. Zygote will bind mount the appropriate user-
-             * specific path. */
-            node->perm = PERM_ANDROID_USER;
-            node->gid = AID_SDCARD_ALL;
-            node->mode = 0770;
-        }
-        break;
-    case PERM_ANDROID_DATA:
-    case PERM_ANDROID_OBB:
-        appid = (appid_t) hashmapGet(fuse->package_to_appid, node->name);
-        if (appid != 0) {
-            node->uid = multiuser_get_uid(parent->userid, appid);
-        }
-        node->mode = 0770;
-        break;
-    case PERM_ANDROID_USER:
-        /* Root of a secondary user */
-        node->perm = PERM_ROOT;
-        node->userid = strtoul(node->name, NULL, 10);
-        node->gid = AID_SDCARD_R;
-        node->mode = 0771;
-        break;
-    }
-}
-
-/* Return if the calling UID holds sdcard_rw. */
-static bool get_caller_has_rw_locked(struct fuse* fuse, const struct fuse_in_header *hdr) {
-    /* No additional permissions enforcement */
-    if (fuse->derive == DERIVE_NONE) {
-        return true;
-    }
-
-    appid_t appid = multiuser_get_app_id(hdr->uid);
-    return hashmapContainsKey(fuse->appid_with_rw, (void*) appid);
-}
-
-/* Kernel has already enforced everything we returned through
- * derive_permissions_locked(), so this is used to lock down access
- * even further, such as enforcing that apps hold sdcard_rw. */
-static bool check_caller_access_to_name(struct fuse* fuse,
-        const struct fuse_in_header *hdr, const struct node* parent_node,
-        const char* name, int mode, bool has_rw) {
-    /* Always block security-sensitive files at root */
-    if (parent_node && parent_node->perm == PERM_ROOT) {
-        if (!strcasecmp(name, "autorun.inf")
-                || !strcasecmp(name, ".android_secure")
-                || !strcasecmp(name, "android_secure")) {
-            return false;
-        }
-    }
-
-    /* No additional permissions enforcement */
-    if (fuse->derive == DERIVE_NONE) {
-        return true;
-    }
-
-    /* Root always has access; access for any other UIDs should always
-     * be controlled through packages.list. */
-    if (hdr->uid == 0) {
-        return true;
-    }
-
-    /* If asking to write, verify that caller either owns the
-     * parent or holds sdcard_rw. */
-    if (mode & W_OK) {
-        if (parent_node && hdr->uid == parent_node->uid) {
-            return true;
-        }
-
-        return has_rw;
-    }
-
-    /* No extra permissions to enforce */
-    return true;
-}
-
-static bool check_caller_access_to_node(struct fuse* fuse,
-        const struct fuse_in_header *hdr, const struct node* node, int mode, bool has_rw) {
-    return check_caller_access_to_name(fuse, hdr, node->parent, node->name, mode, has_rw);
+        /* all files owned by root.sdcard */
+    attr->uid = 0;
+    attr->gid = AID_SDCARD_RW;
 }
 
 struct node *create_node_locked(struct fuse* fuse,
@@ -587,8 +330,6 @@ struct node *create_node_locked(struct fuse* fuse,
     node->namelen = namelen;
     node->nid = ptr_to_id(node);
     node->gen = fuse->next_generation++;
-
-    derive_permissions_locked(fuse, parent, node);
     acquire_node_locked(node);
     add_node_to_parent_locked(node, parent);
     return node;
@@ -681,56 +422,18 @@ static struct node* acquire_or_create_child_locked(
     return child;
 }
 
-static void fuse_init(struct fuse *fuse, int fd, const char *source_path,
-        gid_t write_gid, derive_t derive, bool split_perms) {
+static void fuse_init(struct fuse *fuse, int fd, const char *source_path)
+{
     pthread_mutex_init(&fuse->lock, NULL);
 
     fuse->fd = fd;
     fuse->next_generation = 0;
-    fuse->derive = derive;
-    fuse->split_perms = split_perms;
-    fuse->write_gid = write_gid;
 
     memset(&fuse->root, 0, sizeof(fuse->root));
     fuse->root.nid = FUSE_ROOT_ID; /* 1 */
     fuse->root.refcount = 2;
     fuse->root.namelen = strlen(source_path);
     fuse->root.name = strdup(source_path);
-    fuse->root.userid = 0;
-    fuse->root.uid = AID_ROOT;
-
-    /* Set up root node for various modes of operation */
-    switch (derive) {
-    case DERIVE_NONE:
-        /* Traditional behavior that treats entire device as being accessible
-         * to sdcard_rw, and no permissions are derived. */
-        fuse->root.perm = PERM_ROOT;
-        fuse->root.mode = 0775;
-        fuse->root.gid = AID_SDCARD_RW;
-        break;
-    case DERIVE_LEGACY:
-        /* Legacy behavior used to support internal multiuser layout which
-         * places user_id at the top directory level, with the actual roots
-         * just below that. Shared OBB path is also at top level. */
-        fuse->root.perm = PERM_LEGACY_PRE_ROOT;
-        fuse->root.mode = 0771;
-        fuse->root.gid = AID_SDCARD_R;
-        fuse->package_to_appid = hashmapCreate(256, str_hash, str_icase_equals);
-        fuse->appid_with_rw = hashmapCreate(128, int_hash, int_equals);
-        snprintf(fuse->obbpath, sizeof(fuse->obbpath), "%s/obb", source_path);
-        fs_prepare_dir(fuse->obbpath, 0775, getuid(), getgid());
-        break;
-    case DERIVE_UNIFIED:
-        /* Unified multiuser layout which places secondary user_id under
-         * /Android/user and shared OBB path under /Android/obb. */
-        fuse->root.perm = PERM_ROOT;
-        fuse->root.mode = 0771;
-        fuse->root.gid = AID_SDCARD_R;
-        fuse->package_to_appid = hashmapCreate(256, str_hash, str_icase_equals);
-        fuse->appid_with_rw = hashmapCreate(128, int_hash, int_equals);
-        snprintf(fuse->obbpath, sizeof(fuse->obbpath), "%s/Android/obb", source_path);
-        break;
-    }
 }
 
 static void fuse_status(struct fuse *fuse, __u64 unique, int err)
@@ -782,7 +485,7 @@ static int fuse_reply_entry(struct fuse* fuse, __u64 unique,
         return -ENOMEM;
     }
     memset(&out, 0, sizeof(out));
-    attr_from_stat(&out.attr, &s, node);
+    attr_from_stat(&out.attr, &s, node->nid);
     out.attr_valid = 10;
     out.entry_valid = 10;
     out.nodeid = node->nid;
@@ -792,7 +495,7 @@ static int fuse_reply_entry(struct fuse* fuse, __u64 unique,
     return NO_STATUS;
 }
 
-static int fuse_reply_attr(struct fuse* fuse, __u64 unique, const struct node* node,
+static int fuse_reply_attr(struct fuse* fuse, __u64 unique, __u64 nid,
         const char* path)
 {
     struct fuse_attr_out out;
@@ -802,7 +505,7 @@ static int fuse_reply_attr(struct fuse* fuse, __u64 unique, const struct node* n
         return -errno;
     }
     memset(&out, 0, sizeof(out));
-    attr_from_stat(&out.attr, &s, node);
+    attr_from_stat(&out.attr, &s, nid);
     out.attr_valid = 10;
     fuse_reply(fuse, unique, &out, sizeof(out));
     return NO_STATUS;
@@ -827,10 +530,6 @@ static int handle_lookup(struct fuse* fuse, struct fuse_handler* handler,
             child_path, sizeof(child_path), 1))) {
         return -ENOENT;
     }
-    if (!check_caller_access_to_name(fuse, hdr, parent_node, name, R_OK, false)) {
-        return -EACCES;
-    }
-
     return fuse_reply_entry(fuse, hdr->unique, parent_node, name, actual_name, child_path);
 }
 
@@ -868,23 +567,17 @@ static int handle_getattr(struct fuse* fuse, struct fuse_handler* handler,
     if (!node) {
         return -ENOENT;
     }
-    if (!check_caller_access_to_node(fuse, hdr, node, R_OK, false)) {
-        return -EACCES;
-    }
-
-    return fuse_reply_attr(fuse, hdr->unique, node, path);
+    return fuse_reply_attr(fuse, hdr->unique, hdr->nodeid, path);
 }
 
 static int handle_setattr(struct fuse* fuse, struct fuse_handler* handler,
         const struct fuse_in_header *hdr, const struct fuse_setattr_in *req)
 {
-    bool has_rw;
     struct node* node;
     char path[PATH_MAX];
     struct timespec times[2];
 
     pthread_mutex_lock(&fuse->lock);
-    has_rw = get_caller_has_rw_locked(fuse, hdr);
     node = lookup_node_and_path_by_id_locked(fuse, hdr->nodeid, path, sizeof(path));
     TRACE("[%d] SETATTR fh=%llx valid=%x @ %llx (%s)\n", handler->token,
             req->fh, req->valid, hdr->nodeid, node ? node->name : "?");
@@ -892,9 +585,6 @@ static int handle_setattr(struct fuse* fuse, struct fuse_handler* handler,
 
     if (!node) {
         return -ENOENT;
-    }
-    if (!check_caller_access_to_node(fuse, hdr, node, W_OK, has_rw)) {
-        return -EACCES;
     }
 
     /* XXX: incomplete implementation on purpose.
@@ -935,20 +625,18 @@ static int handle_setattr(struct fuse* fuse, struct fuse_handler* handler,
             return -errno;
         }
     }
-    return fuse_reply_attr(fuse, hdr->unique, node, path);
+    return fuse_reply_attr(fuse, hdr->unique, hdr->nodeid, path);
 }
 
 static int handle_mknod(struct fuse* fuse, struct fuse_handler* handler,
         const struct fuse_in_header* hdr, const struct fuse_mknod_in* req, const char* name)
 {
-    bool has_rw;
     struct node* parent_node;
     char parent_path[PATH_MAX];
     char child_path[PATH_MAX];
     const char* actual_name;
 
     pthread_mutex_lock(&fuse->lock);
-    has_rw = get_caller_has_rw_locked(fuse, hdr);
     parent_node = lookup_node_and_path_by_id_locked(fuse, hdr->nodeid,
             parent_path, sizeof(parent_path));
     TRACE("[%d] MKNOD %s 0%o @ %llx (%s)\n", handler->token,
@@ -958,9 +646,6 @@ static int handle_mknod(struct fuse* fuse, struct fuse_handler* handler,
     if (!parent_node || !(actual_name = find_file_within(parent_path, name,
             child_path, sizeof(child_path), 1))) {
         return -ENOENT;
-    }
-    if (!check_caller_access_to_name(fuse, hdr, parent_node, name, W_OK, has_rw)) {
-        return -EACCES;
     }
     __u32 mode = (req->mode & (~0777)) | 0664;
     if (mknod(child_path, mode, req->rdev) < 0) {
@@ -972,14 +657,12 @@ static int handle_mknod(struct fuse* fuse, struct fuse_handler* handler,
 static int handle_mkdir(struct fuse* fuse, struct fuse_handler* handler,
         const struct fuse_in_header* hdr, const struct fuse_mkdir_in* req, const char* name)
 {
-    bool has_rw;
     struct node* parent_node;
     char parent_path[PATH_MAX];
     char child_path[PATH_MAX];
     const char* actual_name;
 
     pthread_mutex_lock(&fuse->lock);
-    has_rw = get_caller_has_rw_locked(fuse, hdr);
     parent_node = lookup_node_and_path_by_id_locked(fuse, hdr->nodeid,
             parent_path, sizeof(parent_path));
     TRACE("[%d] MKDIR %s 0%o @ %llx (%s)\n", handler->token,
@@ -990,45 +673,21 @@ static int handle_mkdir(struct fuse* fuse, struct fuse_handler* handler,
             child_path, sizeof(child_path), 1))) {
         return -ENOENT;
     }
-    if (!check_caller_access_to_name(fuse, hdr, parent_node, name, W_OK, has_rw)) {
-        return -EACCES;
-    }
     __u32 mode = (req->mode & (~0777)) | 0775;
     if (mkdir(child_path, mode) < 0) {
         return -errno;
     }
-
-    /* When creating /Android/data and /Android/obb, mark them as .nomedia */
-    if (parent_node->perm == PERM_ANDROID && !strcasecmp(name, "data")) {
-        char nomedia[PATH_MAX];
-        snprintf(nomedia, PATH_MAX, "%s/.nomedia", child_path);
-        if (touch(nomedia, 0664) != 0) {
-            ERROR("Failed to touch(%s): %s\n", nomedia, strerror(errno));
-            return -ENOENT;
-        }
-    }
-    if (parent_node->perm == PERM_ANDROID && !strcasecmp(name, "obb")) {
-        char nomedia[PATH_MAX];
-        snprintf(nomedia, PATH_MAX, "%s/.nomedia", fuse->obbpath);
-        if (touch(nomedia, 0664) != 0) {
-            ERROR("Failed to touch(%s): %s\n", nomedia, strerror(errno));
-            return -ENOENT;
-        }
-    }
-
     return fuse_reply_entry(fuse, hdr->unique, parent_node, name, actual_name, child_path);
 }
 
 static int handle_unlink(struct fuse* fuse, struct fuse_handler* handler,
         const struct fuse_in_header* hdr, const char* name)
 {
-    bool has_rw;
     struct node* parent_node;
     char parent_path[PATH_MAX];
     char child_path[PATH_MAX];
 
     pthread_mutex_lock(&fuse->lock);
-    has_rw = get_caller_has_rw_locked(fuse, hdr);
     parent_node = lookup_node_and_path_by_id_locked(fuse, hdr->nodeid,
             parent_path, sizeof(parent_path));
     TRACE("[%d] UNLINK %s @ %llx (%s)\n", handler->token,
@@ -1039,9 +698,6 @@ static int handle_unlink(struct fuse* fuse, struct fuse_handler* handler,
             child_path, sizeof(child_path), 1)) {
         return -ENOENT;
     }
-    if (!check_caller_access_to_name(fuse, hdr, parent_node, name, W_OK, has_rw)) {
-        return -EACCES;
-    }
     if (unlink(child_path) < 0) {
         return -errno;
     }
@@ -1051,13 +707,11 @@ static int handle_unlink(struct fuse* fuse, struct fuse_handler* handler,
 static int handle_rmdir(struct fuse* fuse, struct fuse_handler* handler,
         const struct fuse_in_header* hdr, const char* name)
 {
-    bool has_rw;
     struct node* parent_node;
     char parent_path[PATH_MAX];
     char child_path[PATH_MAX];
 
     pthread_mutex_lock(&fuse->lock);
-    has_rw = get_caller_has_rw_locked(fuse, hdr);
     parent_node = lookup_node_and_path_by_id_locked(fuse, hdr->nodeid,
             parent_path, sizeof(parent_path));
     TRACE("[%d] RMDIR %s @ %llx (%s)\n", handler->token,
@@ -1067,9 +721,6 @@ static int handle_rmdir(struct fuse* fuse, struct fuse_handler* handler,
     if (!parent_node || !find_file_within(parent_path, name,
             child_path, sizeof(child_path), 1)) {
         return -ENOENT;
-    }
-    if (!check_caller_access_to_name(fuse, hdr, parent_node, name, W_OK, has_rw)) {
-        return -EACCES;
     }
     if (rmdir(child_path) < 0) {
         return -errno;
@@ -1081,7 +732,6 @@ static int handle_rename(struct fuse* fuse, struct fuse_handler* handler,
         const struct fuse_in_header* hdr, const struct fuse_rename_in* req,
         const char* old_name, const char* new_name)
 {
-    bool has_rw;
     struct node* old_parent_node;
     struct node* new_parent_node;
     struct node* child_node;
@@ -1093,7 +743,6 @@ static int handle_rename(struct fuse* fuse, struct fuse_handler* handler,
     int res;
 
     pthread_mutex_lock(&fuse->lock);
-    has_rw = get_caller_has_rw_locked(fuse, hdr);
     old_parent_node = lookup_node_and_path_by_id_locked(fuse, hdr->nodeid,
             old_parent_path, sizeof(old_parent_path));
     new_parent_node = lookup_node_and_path_by_id_locked(fuse, req->newdir,
@@ -1104,14 +753,6 @@ static int handle_rename(struct fuse* fuse, struct fuse_handler* handler,
             req->newdir, new_parent_node ? new_parent_node->name : "?");
     if (!old_parent_node || !new_parent_node) {
         res = -ENOENT;
-        goto lookup_error;
-    }
-    if (!check_caller_access_to_name(fuse, hdr, old_parent_node, old_name, W_OK, has_rw)) {
-        res = -EACCES;
-        goto lookup_error;
-    }
-    if (!check_caller_access_to_name(fuse, hdr, new_parent_node, new_name, W_OK, has_rw)) {
-        res = -EACCES;
         goto lookup_error;
     }
     child_node = lookup_child_by_name_locked(old_parent_node, old_name);
@@ -1159,28 +800,15 @@ lookup_error:
     return res;
 }
 
-static int open_flags_to_access_mode(int open_flags) {
-    if ((open_flags & O_ACCMODE) == O_RDONLY) {
-        return R_OK;
-    } else if ((open_flags & O_ACCMODE) == O_WRONLY) {
-        return W_OK;
-    } else {
-        /* Probably O_RDRW, but treat as default to be safe */
-        return R_OK | W_OK;
-    }
-}
-
 static int handle_open(struct fuse* fuse, struct fuse_handler* handler,
         const struct fuse_in_header* hdr, const struct fuse_open_in* req)
 {
-    bool has_rw;
     struct node* node;
     char path[PATH_MAX];
     struct fuse_open_out out;
     struct handle *h;
 
     pthread_mutex_lock(&fuse->lock);
-    has_rw = get_caller_has_rw_locked(fuse, hdr);
     node = lookup_node_and_path_by_id_locked(fuse, hdr->nodeid, path, sizeof(path));
     TRACE("[%d] OPEN 0%o @ %llx (%s)\n", handler->token,
             req->flags, hdr->nodeid, node ? node->name : "?");
@@ -1188,10 +816,6 @@ static int handle_open(struct fuse* fuse, struct fuse_handler* handler,
 
     if (!node) {
         return -ENOENT;
-    }
-    if (!check_caller_access_to_node(fuse, hdr, node,
-            open_flags_to_access_mode(req->flags), has_rw)) {
-        return -EACCES;
     }
     h = malloc(sizeof(*h));
     if (!h) {
@@ -1337,9 +961,6 @@ static int handle_opendir(struct fuse* fuse, struct fuse_handler* handler,
     if (!node) {
         return -ENOENT;
     }
-    if (!check_caller_access_to_node(fuse, hdr, node, R_OK, false)) {
-        return -EACCES;
-    }
     h = malloc(sizeof(*h));
     if (!h) {
         return -ENOMEM;
@@ -1351,8 +972,6 @@ static int handle_opendir(struct fuse* fuse, struct fuse_handler* handler,
         return -errno;
     }
     out.fh = ptr_to_id(h);
-    out.open_flags = 0;
-    out.padding = 0;
     fuse_reply(fuse, hdr->unique, &out, sizeof(out));
     return NO_STATUS;
 }
@@ -1364,7 +983,6 @@ static int handle_readdir(struct fuse* fuse, struct fuse_handler* handler,
     struct fuse_dirent *fde = (struct fuse_dirent*) buffer;
     struct dirent *de;
     struct dirhandle *h = id_to_ptr(req->fh);
-    struct node* parent_node;
 
     TRACE("[%d] READDIR %p\n", handler->token, h);
     if (req->offset == 0) {
@@ -1372,7 +990,6 @@ static int handle_readdir(struct fuse* fuse, struct fuse_handler* handler,
         TRACE("[%d] calling rewinddir()\n", handler->token);
         rewinddir(h->d);
     }
-skip:
     de = readdir(h->d);
     if (!de) {
         return 0;
@@ -1382,13 +999,6 @@ skip:
     fde->off = req->offset + 1;
     fde->type = de->d_type;
     fde->namelen = strlen(de->d_name);
-
-    parent_node = lookup_node_by_id_locked(fuse, hdr->nodeid);
-
-    if (!check_caller_access_to_name(fuse, hdr, parent_node, de->d_name, R_OK, false)) {
-        goto skip;
-    }
-
     memcpy(fde->name, de->d_name, fde->namelen + 1);
     fuse_reply(fuse, hdr->unique, fde,
             FUSE_DIRENT_ALIGN(sizeof(struct fuse_dirent) + fde->namelen));
@@ -1596,123 +1206,6 @@ static void* start_handler(void* data)
     return NULL;
 }
 
-static bool remove_str_to_int(void *key, void *value, void *context) {
-    Hashmap* map = context;
-    hashmapRemove(map, key);
-    free(key);
-    return true;
-}
-
-static bool remove_int_to_null(void *key, void *value, void *context) {
-    Hashmap* map = context;
-    hashmapRemove(map, key);
-    return true;
-}
-
-static int read_package_list(struct fuse *fuse) {
-    pthread_mutex_lock(&fuse->lock);
-
-    hashmapForEach(fuse->package_to_appid, remove_str_to_int, fuse->package_to_appid);
-    hashmapForEach(fuse->appid_with_rw, remove_int_to_null, fuse->appid_with_rw);
-
-    FILE* file = fopen(kPackagesListFile, "r");
-    if (!file) {
-        ERROR("failed to open package list: %s\n", strerror(errno));
-        pthread_mutex_unlock(&fuse->lock);
-        return -1;
-    }
-
-    char buf[512];
-    while (fgets(buf, sizeof(buf), file) != NULL) {
-        char package_name[512];
-        int appid;
-        char gids[512];
-
-        if (sscanf(buf, "%s %d %*d %*s %*s %s", package_name, &appid, gids) == 3) {
-            char* package_name_dup = strdup(package_name);
-            hashmapPut(fuse->package_to_appid, package_name_dup, (void*) appid);
-
-            char* token = strtok(gids, ",");
-            while (token != NULL) {
-                if (strtoul(token, NULL, 10) == fuse->write_gid) {
-                    hashmapPut(fuse->appid_with_rw, (void*) appid, (void*) 1);
-                    break;
-                }
-                token = strtok(NULL, ",");
-            }
-        }
-    }
-
-    TRACE("read_package_list: found %d packages, %d with write_gid\n",
-            hashmapSize(fuse->package_to_appid),
-            hashmapSize(fuse->appid_with_rw));
-    fclose(file);
-    pthread_mutex_unlock(&fuse->lock);
-    return 0;
-}
-
-static void watch_package_list(struct fuse* fuse) {
-    struct inotify_event *event;
-    char event_buf[512];
-
-    int nfd = inotify_init();
-    if (nfd < 0) {
-        ERROR("inotify_init failed: %s\n", strerror(errno));
-        return;
-    }
-
-    bool active = false;
-    while (1) {
-        if (!active) {
-            int res = inotify_add_watch(nfd, kPackagesListFile, IN_DELETE_SELF);
-            if (res == -1) {
-                if (errno == ENOENT || errno == EACCES) {
-                    /* Framework may not have created yet, sleep and retry */
-                    ERROR("missing packages.list; retrying\n");
-                    sleep(3);
-                    continue;
-                } else {
-                    ERROR("inotify_add_watch failed: %s\n", strerror(errno));
-                    return;
-                }
-            }
-
-            /* Watch above will tell us about any future changes, so
-             * read the current state. */
-            if (read_package_list(fuse) == -1) {
-                ERROR("read_package_list failed: %s\n", strerror(errno));
-                return;
-            }
-            active = true;
-        }
-
-        int event_pos = 0;
-        int res = read(nfd, event_buf, sizeof(event_buf));
-        if (res < (int) sizeof(*event)) {
-            if (errno == EINTR)
-                continue;
-            ERROR("failed to read inotify event: %s\n", strerror(errno));
-            return;
-        }
-
-        while (res >= (int) sizeof(*event)) {
-            int event_size;
-            event = (struct inotify_event *) (event_buf + event_pos);
-
-            TRACE("inotify event: %08x\n", event->mask);
-            if ((event->mask & IN_IGNORED) == IN_IGNORED) {
-                /* Previously watched file was deleted, probably due to move
-                 * that swapped in new data; re-arm the watch and read. */
-                active = false;
-            }
-
-            event_size = sizeof(*event) + event->len;
-            res -= event_size;
-            event_pos += event_size;
-        }
-    }
-}
-
 static int ignite_fuse(struct fuse* fuse, int num_threads)
 {
     struct fuse_handler* handlers;
@@ -1720,7 +1213,7 @@ static int ignite_fuse(struct fuse* fuse, int num_threads)
 
     handlers = malloc(num_threads * sizeof(struct fuse_handler));
     if (!handlers) {
-        ERROR("cannot allocate storage for threads\n");
+        ERROR("cannot allocate storage for threads");
         return -ENOMEM;
     }
 
@@ -1729,25 +1222,16 @@ static int ignite_fuse(struct fuse* fuse, int num_threads)
         handlers[i].token = i;
     }
 
-    /* When deriving permissions, this thread is used to process inotify events,
-     * otherwise it becomes one of the FUSE handlers. */
-    i = (fuse->derive == DERIVE_NONE) ? 1 : 0;
-    for (; i < num_threads; i++) {
+    for (i = 1; i < num_threads; i++) {
         pthread_t thread;
         int res = pthread_create(&thread, NULL, start_handler, &handlers[i]);
         if (res) {
-            ERROR("failed to start thread #%d, error=%d\n", i, res);
+            ERROR("failed to start thread #%d, error=%d", i, res);
             goto quit;
         }
     }
-
-    if (fuse->derive == DERIVE_NONE) {
-        handle_fuse_requests(&handlers[0]);
-    } else {
-        watch_package_list(fuse);
-    }
-
-    ERROR("terminated prematurely\n");
+    handle_fuse_requests(&handlers[0]);
+    ERROR("terminated prematurely");
 
     /* don't bother killing all of the other threads or freeing anything,
      * should never get here anyhow */
@@ -1757,21 +1241,14 @@ quit:
 
 static int usage()
 {
-    ERROR("usage: sdcard [OPTIONS] <source_path> <dest_path>\n"
-            "    -u: specify UID to run as\n"
-            "    -g: specify GID to run as\n"
-            "    -w: specify GID required to write (default sdcard_rw)\n"
-            "    -t: specify number of threads to use (default %d)\n"
-            "    -d: derive file permissions based on path\n"
-            "    -l: derive file permissions based on legacy internal layout\n"
-            "    -s: split derived permissions for pics, av (requires -d or -l)\n"
+    ERROR("usage: sdcard [-t<threads>] <source_path> <dest_path> <uid> <gid>\n"
+            "    -t<threads>: specify number of threads to use, default -t%d\n"
             "\n", DEFAULT_NUM_THREADS);
     return 1;
 }
 
-static int run(const char* source_path, const char* dest_path, uid_t uid,
-        gid_t gid, gid_t write_gid, int num_threads, derive_t derive,
-        bool split_perms) {
+static int run(const char* source_path, const char* dest_path, uid_t uid, gid_t gid,
+        int num_threads) {
     int fd;
     char opts[256];
     int res;
@@ -1782,7 +1259,7 @@ static int run(const char* source_path, const char* dest_path, uid_t uid,
 
     fd = open("/dev/fuse", O_RDWR);
     if (fd < 0){
-        ERROR("cannot open fuse device: %s\n", strerror(errno));
+        ERROR("cannot open fuse device (error %d)\n", errno);
         return -1;
     }
 
@@ -1792,29 +1269,23 @@ static int run(const char* source_path, const char* dest_path, uid_t uid,
 
     res = mount("/dev/fuse", dest_path, "fuse", MS_NOSUID | MS_NODEV, opts);
     if (res < 0) {
-        ERROR("cannot mount fuse filesystem: %s\n", strerror(errno));
-        goto error;
-    }
-
-    res = setgroups(sizeof(kGroups) / sizeof(kGroups[0]), kGroups);
-    if (res < 0) {
-        ERROR("cannot setgroups: %s\n", strerror(errno));
+        ERROR("cannot mount fuse filesystem (error %d)\n", errno);
         goto error;
     }
 
     res = setgid(gid);
     if (res < 0) {
-        ERROR("cannot setgid: %s\n", strerror(errno));
+        ERROR("cannot setgid (error %d)\n", errno);
         goto error;
     }
 
     res = setuid(uid);
     if (res < 0) {
-        ERROR("cannot setuid: %s\n", strerror(errno));
+        ERROR("cannot setuid (error %d)\n", errno);
         goto error;
     }
 
-    fuse_init(&fuse, fd, source_path, write_gid, derive, split_perms);
+    fuse_init(&fuse, fd, source_path);
 
     umask(0);
     res = ignite_fuse(&fuse, num_threads);
@@ -1834,53 +1305,34 @@ int sdcard_main(int argc, char **argv)
     const char *dest_path = NULL;
     uid_t uid = 0;
     gid_t gid = 0;
-    gid_t write_gid = AID_SDCARD_RW;
     int num_threads = DEFAULT_NUM_THREADS;
-    derive_t derive = DERIVE_NONE;
-    bool split_perms = false;
     int i;
     struct rlimit rlim;
 
-    int opt;
-    while ((opt = getopt(argc, argv, "u:g:w:t:dls")) != -1) {
-        switch (opt) {
-            case 'u':
-                uid = strtoul(optarg, NULL, 10);
-                break;
-            case 'g':
-                gid = strtoul(optarg, NULL, 10);
-                break;
-            case 'w':
-                write_gid = strtoul(optarg, NULL, 10);
-                break;
-            case 't':
-                num_threads = strtoul(optarg, NULL, 10);
-                break;
-            case 'd':
-                derive = DERIVE_UNIFIED;
-                break;
-            case 'l':
-                derive = DERIVE_LEGACY;
-                break;
-            case 's':
-                split_perms = true;
-                break;
-            case '?':
-            default:
-                return usage();
-        }
-    }
-
-    for (i = optind; i < argc; i++) {
+    for (i = 1; i < argc; i++) {
         char* arg = argv[i];
-        if (!source_path) {
+        if (!strncmp(arg, "-t", 2))
+            num_threads = strtoul(arg + 2, 0, 10);
+        else if (!source_path)
             source_path = arg;
-        } else if (!dest_path) {
+        else if (!dest_path)
             dest_path = arg;
-        } else if (!uid) {
-            uid = strtoul(arg, NULL, 10);
+        else if (!uid) {
+            char* endptr = NULL;
+            errno = 0;
+            uid = strtoul(arg, &endptr, 10);
+            if (*endptr != '\0' || errno != 0) {
+                ERROR("Invalid uid");
+                return usage();
+            }
         } else if (!gid) {
-            gid = strtoul(arg, NULL, 10);
+            char* endptr = NULL;
+            errno = 0;
+            gid = strtoul(arg, &endptr, 10);
+            if (*endptr != '\0' || errno != 0) {
+                ERROR("Invalid gid");
+                return usage();
+            }
         } else {
             ERROR("too many arguments\n");
             return usage();
@@ -1903,10 +1355,6 @@ int sdcard_main(int argc, char **argv)
         ERROR("number of threads must be at least 1\n");
         return usage();
     }
-    if (split_perms && derive == DERIVE_NONE) {
-        ERROR("cannot split permissions without deriving\n");
-        return usage();
-    }
 
     rlim.rlim_cur = 8192;
     rlim.rlim_max = 8192;
@@ -1914,6 +1362,6 @@ int sdcard_main(int argc, char **argv)
         ERROR("Error setting RLIMIT_NOFILE, errno = %d\n", errno);
     }
 
-    res = run(source_path, dest_path, uid, gid, write_gid, num_threads, derive, split_perms);
+    res = run(source_path, dest_path, uid, gid, num_threads);
     return res < 0 ? 1 : 0;
 }

@@ -684,7 +684,7 @@ static int draw_text(const char *str, int x, int y)
         x = (gr_fb_width() - str_len_px) / 2;
     if (y < 0)
         y = (gr_fb_height() - char_height) / 2;
-    gr_text(x, y, str, 0);
+    gr_text(x, y, str/*, 0*/);
 
     return y + char_height;
 }
@@ -705,7 +705,7 @@ static void draw_capacity(struct charger *charger)
     x = (gr_fb_width() - str_len_px) / 2;
     y = (gr_fb_height() + char_height) / 2;
     android_green();
-    gr_text(x, y, cap_str, 0);
+    gr_text(x, y, cap_str/*, 0*/);
 }
 
 /* returns the last y-offset of where the surface ends */
@@ -795,8 +795,8 @@ static void update_screen_state(struct charger *charger, int64_t now)
     if (batt_anim->cur_cycle == batt_anim->num_cycles) {
         reset_animation(batt_anim);
         charger->next_screen_transition = -1;
-        gr_fb_blank(true);
         set_backlight(false);
+        gr_fb_blank(true);
 
 #ifdef ALLOW_SUSPEND_IN_CHARGER
         write_file(SYS_POWER_STATE, "mem", strlen("mem"));
@@ -1268,7 +1268,7 @@ int main(int argc, char **argv)
     charger->uevent_fd = fd;
     coldboot(charger, "/sys/class/power_supply", "add");
 
-    ret = res_create_display_surface("charger/battery_fail", &charger->surf_unknown);
+    ret = res_create_surface("charger/battery_fail", &charger->surf_unknown);
     if (ret < 0) {
         LOGE("Cannot load image\n");
         charger->surf_unknown = NULL;
@@ -1277,7 +1277,7 @@ int main(int argc, char **argv)
     for (i = 0; i < charger->batt_anim->num_frames; i++) {
         struct frame *frame = &charger->batt_anim->frames[i];
 
-        ret = res_create_display_surface(frame->name, &frame->surface);
+        ret = res_create_surface(frame->name, &frame->surface);
         if (ret < 0) {
             LOGE("Cannot load image %s\n", frame->name);
             /* TODO: free the already allocated surfaces... */
@@ -1290,8 +1290,8 @@ int main(int argc, char **argv)
     ev_sync_key_state(set_key_callback, charger);
 
 #ifndef CHARGER_DISABLE_INIT_BLANK
-    gr_fb_blank(true);
     set_backlight(false);
+    gr_fb_blank(true);
 #endif
 
     charger->next_screen_transition = now - 1;

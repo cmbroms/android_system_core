@@ -675,9 +675,6 @@ struct output_file *output_file_open_fd(int fd, unsigned int block_size, int64_t
 	} else {
 		out = output_file_new_normal();
 	}
-	if (!out) {
-		return NULL;
-	}
 
 	out->ops->open(out, fd);
 
@@ -731,12 +728,10 @@ int write_fd_chunk(struct output_file *out, unsigned int len,
 	}
 	pos = lseek64(fd, offset, SEEK_SET);
 	if (pos < 0) {
-                free(data);
 		return -errno;
 	}
 	ret = read_all(fd, data, len);
 	if (ret < 0) {
-                free(data);
 		return ret;
 	}
 	ptr = data;
